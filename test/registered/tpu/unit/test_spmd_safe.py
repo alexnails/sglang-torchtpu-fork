@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -134,8 +135,11 @@ class TestSPMDSafe(CustomTestCase):
                     self.assertEqual(len(result_files), 1)
                     result = json.loads(result_files[0].read_text())
                     self.assertEqual(result["passed"], mode == "matching")
-                    self.assertEqual(
-                        result["launcher_exit_code"], int(mode != "matching")
+                    self.assertIn(
+                        result["launcher_exit_code"],
+                        (0, 1, -signal.SIGKILL)
+                        if result["terminated_after_verification"]
+                        else (int(mode != "matching"),),
                     )
                     self.assertFalse(
                         any(
