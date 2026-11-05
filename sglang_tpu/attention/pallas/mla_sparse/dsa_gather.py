@@ -26,6 +26,27 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 
+# Most `num_lanes`-row subchunks a SparseCore subcore gathers per block.
+_MAX_ROW_SUBCHUNKS = 32
+
+
+def gather_block_size() -> int:
+    """Indices per full dsa_gather block on this chip (16384 on tpu7x).
+
+    With the default ``num_row_subchunks``, a gather of at least this many
+    indices uses full blocks: dsa_gather pads the count up to a multiple of
+    this and slices the output back, so a count that is already a multiple
+    skips that copy.
+    """
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    return (
+        sc_info.num_lanes
+        * _MAX_ROW_SUBCHUNKS
+        * sc_info.num_cores
+        * sc_info.num_subcores
+    )
+
 
 def main_kernel(
     nope_in_hbm_ref: Any,
@@ -268,7 +289,7 @@ def dsa_gather(
         # a block bigger than out_size leaves subcores idle: with 32 subchunks a
         # decode step's 2048 rows would all land on 4 of the 32 subcores.
         num_row_subchunks = num_streams
-        while num_row_subchunks < 32 and (
+        while num_row_subchunks < _MAX_ROW_SUBCHUNKS and (
             row_subchunk_size * num_row_subchunks * num_cores < out_size
         ):
             num_row_subchunks *= 2

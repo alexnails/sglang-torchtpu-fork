@@ -222,6 +222,53 @@ def _build_pallas_sparse_mla_kernel_op(
     return custom_op
 
 
+def gather_aligned_width(
+    width: int,
+    num_tokens: int,
+    *,
+    chunk_tokens: int,
+    granule: int,
+    max_growth: float = 1.125,
+) -> int:
+    """Row width at most ``max_growth`` times ``width`` (whole lanes) that makes
+    every sparse-MLA gather chunk of a ``num_tokens`` batch a whole number of
+    SparseCore gather blocks, or ``width`` when there is none.
+
+    The per-query kernel gathers ``chunk * width`` rows per chunk (chunks of
+    ``min(chunk_tokens, max(64, num_tokens))`` tokens, see
+    sparse_mla_attention_fused). dsa_gather pads a count that is not a multiple
+    of its block (``granule``) and slices the output back, a full copy of the
+    gathered keys (``[64 * 2176, 512]`` bytes per layer at a 64-request decode).
+    The extra columns are ``-1``: masked, at the cost of their gathers.
+    """
+    if granule <= 0 or num_tokens <= 0:
+        return width
+    chunk = min(chunk_tokens, max(64, num_tokens))
+    sizes = {min(chunk, num_tokens), num_tokens % chunk} - {0}
+    candidate = width
+    while candidate <= width * max_growth:
+        if all(size * candidate % granule == 0 for size in sizes):
+            return candidate
+        candidate += 128
+    return width
+
+
+def _kpool_row_width(backend, forward_batch, num_tokens: int) -> int:
+    """index_topk_kpool's row width for this batch (topk_row_width, widened to
+    whole SparseCore gather blocks for plain decode batches)."""
+    width = backend._kpool_width
+    mode = getattr(forward_batch, "forward_mode", None)
+    granule = getattr(backend, "_gather_block", 0)
+    if not granule or mode is None or not mode.is_decode():
+        return width
+    return gather_aligned_width(
+        width,
+        num_tokens,
+        chunk_tokens=getattr(backend, "_gather_chunk_tokens", 64),
+        granule=granule,
+    )
+
+
 def _kpool_query_bound(metadata, *, num_tokens: int) -> int:
     """Static per-request new-token bound for fused kpool pooling.
 
@@ -280,6 +327,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         if self._kpool > 1:
             self._kpool_width = topk_row_width(hf_config)
             self._index_topk_op = build_dsa_kpool_topk_op()
+            from sglang_tpu.attention.pallas.mla_sparse.dsa_gather import (
+                gather_block_size,
+            )
+
+            # Read once here, outside the compiled forward (_kpool_row_width).
+            self._gather_block = gather_block_size()
         else:
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
@@ -347,6 +400,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # opt-in adds a prefill op: decode, verify and draft extend keep the
         # per-query kernel.
         self._prefill_op = None
+        # Tokens per gather chunk of the per-query op (its default, or the
+        # q-block opt-in's), for _kpool_row_width.
+        self._gather_chunk_tokens = 64
         if not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get():
             return _build_pallas_sparse_mla_kernel_op()
         if self._kpool == 1:
@@ -358,6 +414,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             QBLOCK_GATHER_CHUNK_TOKENS,
         )
 
+        self._gather_chunk_tokens = QBLOCK_GATHER_CHUNK_TOKENS
         self._prefill_op = _build_pallas_sparse_mla_kernel_op(
             self._kpool, QBLOCK_GATHER_CHUNK_TOKENS
         )
@@ -525,7 +582,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             weight_scale,
             self._topk,
             kpool,
-            self._kpool_width,
+            _kpool_row_width(self, forward_batch, query.shape[0]),
             metadata.decode_query_size,
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
         )

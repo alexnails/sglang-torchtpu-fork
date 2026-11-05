@@ -19,6 +19,7 @@ from sglang_tpu.attention_pallas_mla import (
 )
 from sglang_tpu.attention_pallas_mla_sparse import (
     TpuPallasSparseMlaAttnBackend,
+    gather_aligned_width,
 )
 from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
@@ -378,6 +379,58 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         args = backend._index_topk_op.call_args.args
         self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
+
+    def test_index_topk_kpool_decode_width_fills_gather_blocks(self):
+        # A 64-token decode at 2176 columns gathers 139264 rows, 8.5 SparseCore
+        # blocks of 16384: widen to 2304 (9 blocks). Other batches keep it.
+        backend = self._backend()
+        backend._kpool_width = 2176
+        backend._gather_chunk_tokens = 256
+        backend._gather_block = 16384  # tpu7x
+        for tokens, decode, width in (
+            (64, True, 2304),
+            (16, True, 2176),
+            (128, True, 2176),
+            (64, False, 2176),
+        ):
+            with self.subTest(tokens=tokens, decode=decode):
+                forward_batch = _forward_batch()
+                forward_batch.forward_mode = SimpleNamespace(
+                    is_decode=lambda decode=decode: decode
+                )
+                t = torch.zeros(tokens, 1)
+                TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+                    backend,
+                    forward_batch=forward_batch,
+                    layer_id=2,
+                    query=t,
+                    key=t,
+                    gate=t,
+                    head_weights=t,
+                    ape=t,
+                    weight_scale=1.0,
+                    kpool=4,
+                )
+                self.assertEqual(backend._index_topk_op.call_args.args[14], width)
+
+    def test_gather_aligned_width(self):
+        for tokens, chunk, width in (
+            (64, 256, 2304),
+            (320, 256, 2304),  # chunks of 256 and 64
+            (192, 64, 2304),
+            (8192, 256, 2176),  # already whole blocks
+            (32, 256, 2176),  # would need 2560 (> 1/8 wider)
+        ):
+            with self.subTest(tokens=tokens, chunk=chunk):
+                self.assertEqual(
+                    gather_aligned_width(
+                        2176, tokens, chunk_tokens=chunk, granule=16384
+                    ),
+                    width,
+                )
+        self.assertEqual(
+            gather_aligned_width(2176, 64, chunk_tokens=256, granule=0), 2176
+        )
 
     def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
         # Decode and uniform verify/draft extend take their static per-request
