@@ -75,11 +75,21 @@ def _kv_appender_specialization_key(
     positions: torch.Tensor,
     cache_loc_2d: torch.Tensor | None,
     commit_lens: torch.Tensor | None,
+    swa_cache_loc: torch.Tensor | None = None,
+    swa_cache_loc_2d: torch.Tensor | None = None,
 ) -> tuple[object, ...]:
     """Key direct-compile artifacts on input shapes and the verify/extend split."""
     return tuple(
         None if t is None else (tuple(t.shape), t.dtype)
-        for t in (target_hidden, cache_loc, positions, cache_loc_2d, commit_lens)
+        for t in (
+            target_hidden,
+            cache_loc,
+            positions,
+            cache_loc_2d,
+            commit_lens,
+            swa_cache_loc,
+            swa_cache_loc_2d,
+        )
     )
 
 
@@ -568,6 +578,21 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             cache_loc = torch.nn.functional.pad(cache_loc, (0, pad_count))
         return target_hidden, cache_loc, positions, None, None
 
+    def _draft_needs_dual_cache_loc(self) -> bool:
+        """True when the draft KV pool holds both full-attention and SWA layers."""
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        pool = (
+            self._dflash_worker.draft_model_runner.token_to_kv_pool
+            if self._dflash_worker is not None
+            else self.model_runner.token_to_kv_pool
+        )
+        return (
+            isinstance(pool, SWAKVPool)
+            and pool.full_layer_nums > 0
+            and pool.swa_layer_nums > 0
+        )
+
     def append_target_hidden_to_draft_kv_by_loc_tpu(
         self,
         *,
@@ -576,6 +601,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Pad inputs and execute compiled draft KV materialization on TPU.
 
@@ -597,6 +624,23 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             cache_loc_2d,
             commit_lens,
         ) = padded
+        extra_kwargs: dict[str, torch.Tensor | None] = {}
+        if swa_cache_loc is not None or swa_cache_loc_2d is not None:
+            if swa_cache_loc is not None and swa_cache_loc.shape[0] < cache_loc.shape[0]:
+                swa_cache_loc = F.pad(
+                    swa_cache_loc, (0, int(cache_loc.shape[0] - swa_cache_loc.shape[0]))
+                )
+            if (
+                swa_cache_loc_2d is not None
+                and cache_loc_2d is not None
+                and swa_cache_loc_2d.shape[0] < cache_loc_2d.shape[0]
+            ):
+                swa_cache_loc_2d = F.pad(
+                    swa_cache_loc_2d,
+                    (0, 0, 0, int(cache_loc_2d.shape[0] - swa_cache_loc_2d.shape[0])),
+                )
+            extra_kwargs["swa_cache_loc"] = swa_cache_loc
+            extra_kwargs["swa_cache_loc_2d"] = swa_cache_loc_2d
 
         with torch.no_grad():
             if self._compiled_kv_appender is None:
@@ -607,6 +651,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 positions=positions,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
+                **extra_kwargs,
             )
 
     def make_null_spec_info(self) -> DFlashVerifyInput:
@@ -799,6 +844,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             draft_token_num,
         )
 
+        dual_loc = self._draft_needs_dual_cache_loc()
+
         def run(bs: int) -> str:
             num_tokens = bs * draft_token_num
             target_hidden = torch.zeros(
@@ -810,12 +857,21 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 (bs, draft_token_num), dtype=cache_loc_dtype, device=device
             )
             commit_lens = torch.zeros((bs,), dtype=torch.int32, device=device)
+            extra = (
+                {
+                    "swa_cache_loc": torch.zeros_like(cache_loc),
+                    "swa_cache_loc_2d": torch.zeros_like(cache_loc_2d),
+                }
+                if dual_loc
+                else {}
+            )
             self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
                 positions=positions,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
+                **extra,
             )
             return f"bs={bs}, tokens={num_tokens}"
 
@@ -842,16 +898,22 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # Extend feeds batch.out_cache_loc straight from the live KV allocator.
         cache_loc_dtype = self._dummy_out_cache_loc_dtype(ForwardMode.EXTEND)
 
+        dual_loc = self._draft_needs_dual_cache_loc()
+
         def run(num_tokens: int) -> str:
             target_hidden = torch.zeros(
                 (num_tokens, target_hidden_size), dtype=dtype, device=device
             )
             cache_loc = torch.zeros((num_tokens,), dtype=cache_loc_dtype, device=device)
             positions = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
+            extra = (
+                {"swa_cache_loc": torch.zeros_like(cache_loc)} if dual_loc else {}
+            )
             self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
                 positions=positions,
+                **extra,
             )
             return f"tokens={num_tokens}"
 

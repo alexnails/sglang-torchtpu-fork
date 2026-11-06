@@ -534,6 +534,22 @@ class KVCacheConfigurator:
         # on the RPA decode path, but nothing establishes that the other TPU
         # backends are exempt, and the cost of refusing a working config is a
         # startup error while the cost of missing one is a silent hang.
+        if (
+            self.is_draft_worker
+            and self.token_to_kv_pool_allocator is not None
+            and hasattr(self.token_to_kv_pool_allocator, "derive_draft_pool_sizes")
+        ):
+            (
+                max_total_num_tokens,
+                full_max_total_num_tokens,
+                swa_max_total_num_tokens,
+            ) = self.token_to_kv_pool_allocator.derive_draft_pool_sizes(
+                self,
+                max_total_num_tokens=max_total_num_tokens,
+                full_max_total_num_tokens=full_max_total_num_tokens,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+            )
+
         if self.device == "tpu" and swa_max_total_num_tokens is not None:
             align_tokens = self.pool_page_size * 8
             aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
@@ -665,7 +681,24 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
-            if isinstance(
+            if hasattr(token_to_kv_pool_allocator, "derive_draft_pool_sizes"):
+                (
+                    max_toks,
+                    full_toks,
+                    swa_toks,
+                ) = token_to_kv_pool_allocator.derive_draft_pool_sizes(
+                    self,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                )
+                sizes = msgspec.structs.replace(
+                    sizes,
+                    max_total_num_tokens=max_toks,
+                    full_max_total_num_tokens=full_toks,
+                    swa_max_total_num_tokens=swa_toks,
+                )
+            elif isinstance(
                 token_to_kv_pool_allocator,
                 (
                     UnifiedMambaTokenToKVPoolAllocator,
@@ -1813,13 +1846,16 @@ class KVCacheConfigurator:
         # would size every stage's pool to the whole model.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
-        size_swa = swa_max_total_num_tokens
+        size_swa = (
+            full_max_total_num_tokens
+            if self.draft_swa_full_capacity
+            else swa_max_total_num_tokens
+        )
         if self.kv_cache_dtype_str == "mxint8" and self.is_hybrid_swa_mtp_draft:
             # Local MTP depths use the allocator's full-capacity identity map.
             if self.draft_swa_full_capacity:
                 swa_attention_layer_ids = [self.draft_model_idx]
                 full_attention_layer_ids = []
-                size_swa = full_max_total_num_tokens
             else:
                 swa_attention_layer_ids = []
                 full_attention_layer_ids = [self.draft_model_idx]
@@ -1839,14 +1875,8 @@ class KVCacheConfigurator:
         swa_dcp_size = get_parallel().attn_dcp_size
         if swa_dcp_size > 1 and self.model_config.is_draft_model:
             swa_dcp_size = 1
-        swa_head_num = max(
-            1,
-            getattr(
-                self.model_config.hf_text_config,
-                "swa_num_key_value_heads",
-                self.model_config.hf_text_config.num_key_value_heads,
-            )
-            // (get_parallel().attn_tp_size // swa_dcp_size),
+        swa_head_num = self.model_config.get_swa_num_kv_heads(
+            get_parallel().attn_tp_size, swa_dcp_size
         )
         mxint8_subpool_kwargs = {}
         if self.kv_cache_dtype_str == "mxint8":
@@ -2543,6 +2573,9 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
+            if hasattr(token_to_kv_pool_allocator, "attach_draft_kv_pool"):
+                token_to_kv_pool_allocator.attach_draft_kv_pool(self, token_to_kv_pool)
+                return token_to_kv_pool_allocator
             if self.is_hybrid_swa and (
                 not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 or token_to_kv_pool.needs_paged_swa_allocator

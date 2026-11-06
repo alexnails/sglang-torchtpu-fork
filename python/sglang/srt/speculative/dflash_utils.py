@@ -425,7 +425,7 @@ def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
-    if sliding_window is None and is_nemotron_35_draft_config(config):
+    if sliding_window is None:
         sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(

@@ -1071,7 +1071,11 @@ class ModelConfig:
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
-            is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
+            is_hybrid_swa_model(
+                self.hf_config.architectures,
+                self.hf_text_config,
+                is_draft_model=self.is_draft_model,
+            )
             and not self.disable_hybrid_swa_memory
         )
         # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
@@ -1567,7 +1571,7 @@ class ModelConfig:
         if self.is_draft_model:
             dcp_size = 1
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
-        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+        if getattr(self.hf_text_config, "swa_num_key_value_heads", None) is not None:
             total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
             return max(1, total_num_kv_heads // kv_tensor_parallel_size)
         elif hasattr(self.hf_text_config, "attention_other_setting"):  # For step3p5
@@ -1818,6 +1822,11 @@ class ModelConfig:
             value = getattr(self.hf_text_config, key, None)
             if value is not None:
                 return value
+        dflash_cfg = getattr(self.hf_text_config, "dflash_config", None) or getattr(
+            self.hf_config, "dflash_config", None
+        )
+        if isinstance(dflash_cfg, dict) and dflash_cfg.get("swa_window_size") is not None:
+            return int(dflash_cfg["swa_window_size"])
         return None
 
     def _validate_quantize_and_serve_config(self):
@@ -2497,7 +2506,21 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
 def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
+    *,
+    is_draft_model: bool = False,
 ):
+    if is_draft_model and hf_text_config is not None:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        if layer_types is not None and not isinstance(layer_types, str):
+            num_layers = getattr(hf_text_config, "num_hidden_layers", len(layer_types))
+            active_types = layer_types[:num_layers]
+            if "sliding_attention" in active_types:
+                return True
+            if not any(
+                arch.endswith(("MTP", "NextN")) or "DeepseekV4" in arch
+                for arch in model_architectures
+            ):
+                return False
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
@@ -2653,6 +2676,14 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif getattr(hf_text_config, "layer_types", None) is not None:
+        layer_types = hf_text_config.layer_types[:num_hidden_layers]
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
     else:
         swa_attention_layer_ids = None

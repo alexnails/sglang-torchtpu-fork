@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1944,12 +1945,32 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
 
         if _is_tpu:
+            extra_kwargs: dict[str, torch.Tensor | None] = {}
+            draft_pool = self.draft_model_runner.token_to_kv_pool
+            if isinstance(draft_pool, SWAKVPool) and draft_pool.swa_layer_nums > 0:
+                swa_loc = draft_pool.translate_loc_from_full_to_swa(cache_loc).to(
+                    cache_loc.dtype
+                )
+                swa_loc_2d = (
+                    draft_pool.translate_loc_from_full_to_swa(cache_loc_2d).to(
+                        cache_loc_2d.dtype
+                    )
+                    if cache_loc_2d is not None
+                    else None
+                )
+                if draft_pool.full_layer_nums == 0:
+                    cache_loc = swa_loc
+                    cache_loc_2d = swa_loc_2d
+                else:
+                    extra_kwargs["swa_cache_loc"] = swa_loc
+                    extra_kwargs["swa_cache_loc_2d"] = swa_loc_2d
             return self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
                 positions=positions,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
+                **extra_kwargs,
             )
         target_hidden, cache_loc, positions, cache_loc_2d, commit_lens = (
             self._append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
@@ -2192,6 +2213,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
     ) -> None:
         """Materialize target context features into the draft TPU KV buffer.
 
@@ -2201,6 +2224,8 @@ class DFlashWorkerV2(BaseSpecWorker):
           positions: Token position IDs.
           cache_loc_2d: 2D padded cache slots [bs, max_len] during verify; None during prefill/extend.
           commit_lens: Accept token counts [bs] during verify; None during prefill/extend.
+          swa_cache_loc: Optional flat 1D SWA slot locations for mixed Full + SWA drafts.
+          swa_cache_loc_2d: Optional 2D SWA slot locations [bs, max_len] during verify.
 
         Examples:
           Prefill / Extend (cache_loc_2d and commit_lens are None):
@@ -2220,6 +2245,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden, cache_loc, positions, cache_loc_2d, commit_lens
             )
         )
+        device = self.model_runner.device
+        if swa_cache_loc is not None:
+            if swa_cache_loc.device != device:
+                swa_cache_loc = swa_cache_loc.to(device, non_blocking=True)
+            if swa_cache_loc.dtype != torch.int64:
+                swa_cache_loc = swa_cache_loc.to(torch.int64)
+        if swa_cache_loc_2d is not None:
+            if swa_cache_loc_2d.device != device:
+                swa_cache_loc_2d = swa_cache_loc_2d.to(device, non_blocking=True)
+            if swa_cache_loc_2d.dtype != torch.int64:
+                swa_cache_loc_2d = swa_cache_loc_2d.to(torch.int64)
 
         with torch.no_grad():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
@@ -2236,15 +2272,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if bs == 0:
                     return
 
+            draft_pool = self.draft_model_runner.token_to_kv_pool
+            if isinstance(draft_pool, SWAKVPool):
+                if draft_pool.full_layer_nums == 0:
+                    draft_pool = draft_pool.swa_kv_pool
+                elif draft_pool.swa_layer_nums == 0:
+                    draft_pool = draft_pool.full_kv_pool
+
             dflash_write_draft_kv(
                 draft_model=self.draft_model,
-                kv_pool=self.draft_model_runner.token_to_kv_pool,
+                kv_pool=draft_pool,
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 max_num_reqs=int(self.model_runner.req_to_token_pool.size),
+                swa_cache_loc=swa_cache_loc,
+                swa_cache_loc_2d=swa_cache_loc_2d,
             )
 
     def _append_target_hidden_to_draft_kv_by_loc_prepare_inputs(

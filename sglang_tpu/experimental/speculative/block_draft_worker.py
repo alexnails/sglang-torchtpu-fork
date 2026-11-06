@@ -12,7 +12,6 @@ from torch import nn
 
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.lora.layers import unwrap_lora_layer
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_disagg
@@ -105,12 +104,21 @@ class TpuBlockDraftWorker(TpuDraftWorker):
 
     @property
     def full_to_swa(self) -> torch.Tensor | None:
-        """Host full-to-SWA slot map when the draft KV lives in the SWA sub-pool, else None."""
-        if not isinstance(self.model_runner.token_to_kv_pool, SWAKVPool):
+        """Host full-to-SWA slot map when the draft has SWA layers, else None."""
+        kv_pool = self.model_runner.token_to_kv_pool
+        if not isinstance(kv_pool, SWAKVPool) or kv_pool.swa_layer_nums == 0:
             return None
-        allocator = self.model_runner.token_to_kv_pool_allocator
-        assert isinstance(allocator, SWATokenToKVPoolAllocator), type(allocator)
-        return allocator.full_to_swa_index_mapping
+        return kv_pool.full_to_swa_index_mapping
+
+    @property
+    def needs_dual_cache_loc(self) -> bool:
+        """True when the draft has both full-attention and SWA layers."""
+        kv_pool = self.model_runner.token_to_kv_pool
+        return (
+            isinstance(kv_pool, SWAKVPool)
+            and kv_pool.full_layer_nums > 0
+            and kv_pool.swa_layer_nums > 0
+        )
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(
@@ -125,6 +133,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         cache_loc: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project target hidden into the draft context KV (extend: all rows; commit: accepted).
 
@@ -137,6 +147,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             positions=positions,
             cache_loc_2d=cache_loc_2d,
             commit_lens=commit_lens,
+            swa_cache_loc=swa_cache_loc,
+            swa_cache_loc_2d=swa_cache_loc_2d,
         )
         assert tail is not None
         return tail
@@ -149,16 +161,20 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # The fused rpa_v3 pool forbids set_kv_buffer (write_target_hidden_kv);
         # dense DFlash and DSpark drafts share one K/V layout and Pallas writer.
         kv_pool = self.model_runner.token_to_kv_pool
         if isinstance(kv_pool, SWAKVPool):
-            # Every layer of a hybrid-SWA draft is SWA; callers pass SWA slots.
-            kv_pool = kv_pool.swa_kv_pool
-        if not isinstance(kv_pool, TpuFusedMHATokenToKVPool):
+            if kv_pool.full_layer_nums == 0:
+                kv_pool = kv_pool.swa_kv_pool
+            elif kv_pool.swa_layer_nums == 0:
+                kv_pool = kv_pool.full_kv_pool
+        if not isinstance(kv_pool, (TpuFusedMHATokenToKVPool, SWAKVPool)):
             raise TypeError(
-                f"{type(self).__name__} needs TpuFusedMHATokenToKVPool, got {type(kv_pool)}."
+                f"{type(self).__name__} needs TpuFusedMHATokenToKVPool or SWAKVPool, got {type(kv_pool)}."
             )
         draft_model = self._draft_model()
         dflash_write_draft_kv(
@@ -170,12 +186,21 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             cache_loc_2d=cache_loc_2d,
             commit_lens=commit_lens,
             max_num_reqs=self.model_runner.req_to_token_pool.size,
+            swa_cache_loc=swa_cache_loc,
+            swa_cache_loc_2d=swa_cache_loc_2d,
         )
         # Read inside the compiled writer, after the write: the TPU KV free fence's tail.
         # A new tensor, not a view of the pool: the copy thread reads it after the
         # next step donates the pool, and an indexed view lowers to an as_strided
         # that relayouts the whole tiled layer on every write. Reducing a slice of
         # the two untiled leading dims avoids both.
+        if isinstance(kv_pool, SWAKVPool):
+            tails = [
+                sub.kv_buffer[-1][:1, :1].to(torch.float32).sum(dim=(1, 2, 3, 4))
+                for sub in (kv_pool.full_kv_pool, kv_pool.swa_kv_pool)
+                if isinstance(sub, TpuFusedMHATokenToKVPool) and sub.kv_buffer
+            ]
+            return tails[0] if len(tails) == 1 else tails[0] + tails[1]
         return kv_pool.kv_buffer[-1][:1, :1].to(torch.float32).sum(dim=(1, 2, 3, 4))
 
     def _draft_model(self) -> DFlashDraftModel:

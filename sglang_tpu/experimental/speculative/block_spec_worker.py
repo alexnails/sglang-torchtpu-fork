@@ -224,10 +224,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             "verify hidden must keep the batch bucket rows"
         )
         full_to_swa = self._block_draft_worker.full_to_swa
+        swa_cache_loc: torch.Tensor | None = None
+        swa_cache_loc_2d: torch.Tensor | None = None
         if full_to_swa is not None:
             # A hybrid-SWA draft writes the SWA slots of the same window, mapped on host.
             swa_candidates = full_to_swa[verify_input.verify_cache_candidates_cpu]
-            rows = select_verify_rows(
+            swa_rows = select_verify_rows(
                 padded_h2d(
                     swa_candidates.to(torch.int64),
                     rows.cache_locs.shape[0],
@@ -237,6 +239,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 state.seq_lens,
                 self.num_verify_rows,
             )
+            if self._block_draft_worker.needs_dual_cache_loc:
+                swa_cache_loc = swa_rows.flat_cache_locs
+                swa_cache_loc_2d = swa_rows.cache_locs
+            else:
+                rows = swa_rows
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
@@ -245,6 +252,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc=rows.flat_cache_locs,
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
+                swa_cache_loc=swa_cache_loc,
+                swa_cache_loc_2d=swa_cache_loc_2d,
             )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
@@ -273,6 +282,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         # finalize keeps HOST_PADDED hidden at the token bucket; pad the host rows to
         # match and upload once. Padded rows write slot 0, like the target forward.
         padded_rows = target_hidden.shape[0]
+        swa_cache_loc_cpu: torch.Tensor | None = None
+        dual_loc = self._block_draft_worker.needs_dual_cache_loc
         if not batch.reqs:
             # A DP-attention rank without prompts (DP padding relabels its batch)
             # still issues the draft KV write; all its rows are padding.
@@ -283,6 +294,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             cache_loc_cpu = torch.zeros(
                 (padded_rows,), dtype=compile_policy.live_cache_loc_dtype()
             )
+            if dual_loc and not self.ships_pd_hidden:
+                swa_cache_loc_cpu = cache_loc_cpu
         else:
             positions_cpu = prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
@@ -291,12 +304,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
             full_to_swa = self._block_draft_worker.full_to_swa
             if full_to_swa is not None and not self.ships_pd_hidden:
-                cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
+                mapped_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
+                if dual_loc:
+                    swa_cache_loc_cpu = mapped_cpu
+                else:
+                    cache_loc_cpu = mapped_cpu
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
         cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
             self.device, non_blocking=True
+        )
+        swa_cache_loc = (
+            pad_rows(swa_cache_loc_cpu, padded_rows).to(
+                self.device, non_blocking=True
+            )
+            if swa_cache_loc_cpu is not None
+            else None
         )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
@@ -309,6 +333,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     target_hidden=target_hidden,
                     positions=positions,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_cache_loc,
                 )
         logits_output.hidden_states = None
         if not batch.reqs:
@@ -344,10 +369,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> None:
         del bonus_tokens
-        if self._block_draft_worker.full_to_swa is not None:
-            raise NotImplementedError(
-                "PD decode-side draft prefill does not support a hybrid-SWA draft."
+        swa_cache_loc: torch.Tensor | None = None
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is not None:
+            loc_cpu = (
+                batch.out_cache_loc
+                if batch.out_cache_loc is not None
+                and batch.out_cache_loc.device.type == "cpu"
+                else cache_loc.cpu()
             )
+            mapped = pad_rows(
+                full_to_swa[loc_cpu].to(cache_loc.dtype),
+                target_hidden.shape[0],
+            ).to(self.device, non_blocking=True)
+            if self._block_draft_worker.needs_dual_cache_loc:
+                swa_cache_loc = mapped
+            else:
+                cache_loc = mapped
         positions = pad_rows(
             prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
@@ -356,7 +394,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         ).to(self.device, non_blocking=True)
         with self._block_draft_worker.draft_context():
             self._block_draft_worker.write_draft_kv(
-                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+                target_hidden=target_hidden,
+                positions=positions,
+                cache_loc=cache_loc,
+                swa_cache_loc=swa_cache_loc,
             )
 
     def make_verify_input(

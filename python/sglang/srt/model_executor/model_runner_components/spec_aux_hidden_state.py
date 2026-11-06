@@ -46,6 +46,7 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_draft_cell_size_per_token: int | None = None
     # Preserve heads/dim for layout-aware MXINT8 sizing; raw payload bytes lose it.
     dflash_draft_kv_geometry: tuple[int, int] | None = None
+    draft_model_config: Any = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -108,6 +109,7 @@ def _resolve_eagle_aux_hidden_state(
     else:
         return
 
+    config.draft_model_config = draft_model_config
     if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
         config.eagle_draft_swa_num_layers = len(
             draft_model_config.swa_attention_layer_ids
@@ -145,6 +147,7 @@ def _resolve_dflash_aux_hidden_state(
             model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
+        config.draft_model_config = draft_model_config
         dflash_draft_config = parse_dflash_draft_config(
             draft_hf_config=draft_model_config.hf_config
         )
