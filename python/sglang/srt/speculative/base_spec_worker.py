@@ -40,7 +40,10 @@ class HiCacheDraftPlan:
 def _can_pack_hicache_mtp(
     spec_algorithm: SpeculativeAlgorithm,
     draft_runners: tuple[ModelRunner, ...],
+    target_pool: object = None,
 ) -> bool:
+    if not getattr(target_pool, "supports_packed_hicache_draft", True):
+        return False
     is_nextn_mtp = (
         spec_algorithm.is_eagle()
         and not spec_algorithm.is_eagle3()
@@ -302,11 +305,20 @@ class BaseSpecWorker(ABC):
                 "HiCache does not support Inkling MTP draft state yet."
             )
 
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        target_pool = target_model_runner.token_to_kv_pool
+        if _can_pack_hicache_mtp(
+            spec_algorithm, draft_runners, target_pool=target_pool
+        ):
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
+            )
+        if not getattr(target_pool, "supports_packed_hicache_draft", True) and (
+            len(draft_pools) > 1
+        ):
+            raise NotImplementedError(
+                "Multi-runner MTP HiCache offload is not supported on unified SWA KV pools."
             )
 
         if get_memory().enable_unified_cache_external_linker:

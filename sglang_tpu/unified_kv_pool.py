@@ -389,6 +389,7 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
     """Unified Hybrid Full/SWA KV pool backed by ``G = full.num_layers`` shared 5D buffers."""
 
     AttnSpec = AttnLayerSpec
+    supports_packed_hicache_draft: bool = False
 
     def __init__(
         self,
@@ -470,6 +471,9 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             self._swa_layer_group[gid] = j // G
 
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        self._attached_draft_pools: List[KVCache] = []
+        self._draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
+        self._draft_swa_uses_full_capacity: bool = False
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
@@ -1067,12 +1071,15 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return full_tokens, full_tokens, min(full_tokens, swa_tokens)
 
     def attach_draft_kv_pool(self, draft_kvc, draft_pool) -> None:
+        if draft_pool is not None and draft_pool not in self._kvcache._attached_draft_pools:
+            self._kvcache._attached_draft_pools.append(draft_pool)
         if not getattr(draft_kvc, "is_hybrid_swa", False):
             return
         if getattr(draft_pool, "swa_layer_nums", 0) == 0:
             draft_pool.register_mapping(self.full_to_swa_index_mapping)
             return
         if self._draft_uses_full_capacity_swa(draft_kvc):
+            self._kvcache._draft_swa_uses_full_capacity = True
             n = self.size_full + self.page_size
             identity = torch.arange(n + 1, dtype=torch.int64, device="cpu")
             identity[-1] = -1
@@ -1094,6 +1101,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 kvcache=getattr(draft_pool, "swa_kv_pool", None),
                 need_sort=self.need_sort,
             )
+            self._kvcache._draft_swa_sidecar = self._draft_swa_sidecar
             self.swa_attn_allocator._sidecar = self._draft_swa_sidecar
             if self.kv_free_fence is not None:
                 self.kv_free_fence.attach(self._draft_swa_sidecar.allocator)

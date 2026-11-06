@@ -1576,7 +1576,7 @@ def build_swa_draft_pools(
     draft_kv_pool: Any,
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
-    """Build a draft SWA sidecar whose indices follow target SWA."""
+    """Build a draft SWA sidecar whose indices follow target SWA (or KV when full-capacity)."""
     draft_swa_pool = draft_kv_pool.swa_kv_pool
     if draft_swa_pool is None:
         raise NotImplementedError(
@@ -1586,9 +1586,38 @@ def build_swa_draft_pools(
         return [], []
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
-    target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    target_kvcache = (
+        allocator.get_kvcache()
+        if allocator is not None and hasattr(allocator, "get_kvcache")
+        else None
+    )
+    swa_entry = host_pool_group.entry_map.get(PoolName.SWA)
+    full_cap_swa = getattr(
+        target_kvcache
+        if target_kvcache is not None
+        else (swa_entry.device_pool if swa_entry is not None else None),
+        "_draft_swa_uses_full_capacity",
+        False,
+    )
+    if not full_cap_swa and swa_entry is None:
+        return [], []
+    target_swa_host_pool = swa_entry.host_pool if swa_entry is not None else None
 
-    if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+    if full_cap_swa:
+        host_pool = _build_mha_mla_host_pool(
+            pool=draft_swa_pool,
+            host_to_device_ratio=host_pool_group.logical_size / draft_swa_pool.size,
+            page_size=controller.page_size,
+            layout=host_pool_group.layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft_swa",
+        )
+        spec = SidecarPoolSpec(
+            pool_name=PoolName.DRAFT_SWA,
+            indices_from_pool=PoolName.KV,
+        )
+    elif isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
         _require_single_row_dsv4_swa_pages(
             logical_page_size=target_swa_host_pool.slot_page_size,
             physical_page_size=draft_swa_pool.page_size,
@@ -1603,6 +1632,11 @@ def build_swa_draft_pools(
             layout=target_swa_host_pool.layout,
             allocator_type=_get_allocator_type(),
         )
+        spec = SidecarPoolSpec(
+            pool_name=PoolName.DRAFT_SWA,
+            indices_from_pool=PoolName.SWA,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
     else:
         host_pool = _build_mha_mla_host_pool(
             pool=draft_swa_pool,
@@ -1612,13 +1646,15 @@ def build_swa_draft_pools(
             allocator_type=_get_allocator_type(),
             pool_label="draft_swa",
         )
+        if hasattr(target_swa_host_pool, "bind_draft_swa_sidecar"):
+            target_swa_host_pool.bind_draft_swa_sidecar(host_pool)
+        spec = SidecarPoolSpec(
+            pool_name=PoolName.DRAFT_SWA,
+            indices_from_pool=PoolName.SWA,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
 
     layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
-    spec = SidecarPoolSpec(
-        pool_name=PoolName.DRAFT_SWA,
-        indices_from_pool=PoolName.SWA,
-        hit_policy=PoolHitPolicy.TRAILING_PAGES,
-    )
     entry = build_pool_entry(
         name=PoolName.DRAFT_SWA,
         host_pool=host_pool,
@@ -1636,9 +1672,28 @@ def build_hicache_draft_sidecars(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
+    if isinstance(draft_kv_pool, SWAKVPool):
+        specs: list[SidecarPoolSpec] = []
+        entries: list[PoolEntry] = []
+        if draft_kv_pool.full_kv_pool.layer_num > 0:
+            f_specs, f_entries = build_full_draft_pools(
+                draft_kv_pool=draft_kv_pool.full_kv_pool,
+                tree_cache=tree_cache,
+            )
+            specs.extend(f_specs)
+            entries.extend(f_entries)
+        if draft_kv_pool.swa_kv_pool.layer_num > 0:
+            s_specs, s_entries = build_swa_draft_pools(
+                draft_kv_pool=draft_kv_pool,
+                tree_cache=tree_cache,
+            )
+            specs.extend(s_specs)
+            entries.extend(s_entries)
+        return specs, entries
     builder = (
         build_swa_draft_pools
         if isinstance(draft_kv_pool, BaseSWAKVPool)
